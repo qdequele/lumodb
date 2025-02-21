@@ -1,7 +1,8 @@
 [package]
-name = "lmdb-rs"
+name = "lumodb"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 bitflags = "2.8.0"
+log = "0.4.26"

@@ -10,14 +10,11 @@ use crate::transaction::Transaction;
 use crate::error::{Error, Result};
 use crate::value::Value;
 use crate::constants::{
-    // Database flags
-    REVERSEKEY, DUPSORT, INTEGERKEY, DUPFIXED, INTEGERDUP, REVERSEDUP, CREATE,
-    // Write flags
-    NOOVERWRITE, NODUPDATA, CURRENT, RESERVE, APPEND, APPENDDUP, MULTIPLE,
-    // Node flags
-    F_BIGDATA, F_DUPDATA, F_SUBDATA, F_DIRTY,
+    // Flags
+    DbFlags, WriteFlags,
     // Global constants
     CORE_DBS,
+
 };
 
 /// Database statistics
@@ -107,7 +104,7 @@ pub struct Database {
     /// Database identifier
     dbi: u32,
     /// Database flags 
-    flags: u32,
+    flags: DbFlags,
     /// Reference to owning transaction
     txn: NonNull<Transaction>,
     /// Database statistics
@@ -133,33 +130,51 @@ impl Database {
     /// # Thread Safety
     /// This operation is not thread-safe and should only be called when no other
     /// threads are accessing the database.
-    pub fn open(txn: &Transaction, name: Option<&str>, flags: u32) -> Result<Self> {
-        // Convert name to CString if provided
+    pub fn open(txn: &Transaction, name: Option<&str>, flags: DbFlags) -> Result<Self> {
+        if !txn.is_valid() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        if flags.contains(DbFlags::DUPSORT) && flags.contains(DbFlags::REVERSEKEY) {
+            return Err(Error::Incompatible);
+        }
+
         let name_cstr = match name {
-            Some(n) => Some(CString::new(n)?),
+            Some(n) => Some(CString::new(n).map_err(|_| Error::EnvInvalidConfig)?),
             None => None,
         };
         
-        // Get next available database ID from transaction
-        let dbi = txn.allocate_dbi()?;
+        let dbi = txn.allocate_dbi().map_err(|e| match e {
+            Error::DbsFull => Error::MaxDbsExceeded,
+            Error::BadRslot => Error::InvalidStateTransition,
+            e => e
+        })?;
         
         let info = DatabaseInfo {
             name: name_cstr,
             dbi,
-            flags,
-            ..Default::default()
+            flags: flags.bits(),
+            cmp: None,
+            dupsort: None,
+            rel: None,
+            relctx: None,
         };
 
         let db = Database {
             dbi,
             flags,
-            txn: NonNull::new(txn)?,
+            txn: NonNull::new(txn).ok_or(Error::BadTxn)?,
             stats: RefCell::new(DbStats::default()),
             info: RefCell::new(info),
         };
 
-        // Register database in transaction
-        txn.register_database(&db, db.info.borrow().name.as_ref())?;
+        txn.register_database(&db, db.info.borrow().name.as_ref())
+            .map_err(|e| match e {
+                Error::Invalid => Error::DbOperationFailed,
+                Error::BadTxn => Error::InvalidTxnState,
+                Error::DbsFull => Error::MaxDbsExceeded,
+                e => e
+            })?;
 
         Ok(db)
     }
@@ -175,13 +190,28 @@ impl Database {
     /// other threads might be accessing it. All cursors must be closed before
     /// calling this method.
     pub fn close(&mut self) -> Result<()> {
-        // Reset database info
-        *self.info.borrow_mut() = DatabaseInfo::default();
-        // Reset statistics
-        *self.stats.borrow_mut() = DbStats::default();
-        // Reset main fields
+        self.validate_db_state()?;
+
+        if !self.txn.as_ref().is_valid() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        if self.txn.as_ref().has_active_cursors(self.dbi) {
+            return Err(Error::ResourceCleanupFailed);
+        }
+
+        if let Err(_) = self.info.try_borrow_mut() {
+            return Err(Error::ResourceCleanupFailed);
+        }
+        *self.info.get_mut() = DatabaseInfo::default();
+
+        if let Err(_) = self.stats.try_borrow_mut() {
+            return Err(Error::ResourceCleanupFailed);
+        }
+        *self.stats.get_mut() = DbStats::default();
+
         self.dbi = 0;
-        self.flags = 0;
+        self.flags = DbFlags::empty();
         
         Ok(())
     }
@@ -198,8 +228,18 @@ impl Database {
     /// # Thread Safety
     /// Safe to call from multiple threads using different transactions.
     pub fn stat(&self, txn: &Transaction) -> Result<&DbStats> {
-        let stats = txn.get_db_stats(self.dbi)?;
-        *self.stats.borrow_mut() = stats;
+        self.validate_transaction(txn)?;
+
+        let stats = txn.get_db_stats(self.dbi)
+            .map_err(|e| match e {
+                Error::BadTxn => Error::InvalidTxnState,
+                Error::BadDbi => Error::BadDbi,
+                e => Error::DbOperationFailed
+            })?;
+
+        *self.stats.try_borrow_mut()
+            .map_err(|_| Error::ResourceCleanupFailed)? = stats;
+        
         Ok(&self.stats.borrow())
     }
 
@@ -214,8 +254,9 @@ impl Database {
     /// # Errors
     /// * `Error::Invalid` - Invalid database handle
     /// * `Error::BadTxn` - Transaction is invalid
-    pub fn flags(&self, _txn: &Transaction) -> Result<u32> {
-        Ok(self.flags)
+    pub fn flags(&self, txn: &Transaction) -> Result<u32> {
+        self.validate_transaction(txn)?;
+        Ok(self.flags.bits())
     }
 
     /// Drop a database.
@@ -234,18 +275,23 @@ impl Database {
     /// This operation requires an exclusive write transaction.
     /// The database must not be accessed after being dropped.
     pub fn drop(&self, txn: &Transaction, del: bool) -> Result<()> {
-        // Check if transaction is writable
-        if txn.is_readonly() {
-            return Err(Error::from(libc::EACCES));
+        self.validate_write_transaction(txn)?;
+
+        if del && self.dbi < CORE_DBS {
+            return Err(Error::Incompatible);
         }
 
-        // Can't delete main DB
-        if del && self.dbi >= CORE_DBS {
-            // Delete database entry from main DB
-            txn.delete_database(self.dbi)?;
+        if del {
+            txn.delete_database(self.dbi).map_err(|e| match e {
+                Error::BadTxn => Error::InvalidTxnState,
+                Error::TxnFull => Error::TxnDirtyLimit,
+                e => Error::DbOperationFailed
+            })?;
         } else {
-            // Just reset the database
-            txn.reset_database(self.dbi)?;
+            txn.reset_database(self.dbi).map_err(|e| match e {
+                Error::BadTxn => Error::InvalidTxnState,
+                e => Error::DbOperationFailed
+            })?;
         }
 
         Ok(())
@@ -267,8 +313,17 @@ impl Database {
     /// * `Error::BadTxn` - Transaction is invalid
     /// * `Error::BadValSize` - Key size is invalid
     pub fn get(&self, txn: &Transaction, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.validate_transaction(txn)?;
+        self.validate_key_size(txn, key)?;
+
         let key_val = Value::new(key);
         txn.get_value(self.dbi, &key_val)
+            .map_err(|e| match e {
+                Error::NotFound => Error::NotFound,
+                Error::BadValSize => Error::BadValSize,
+                Error::BadTxn => Error::InvalidTxnState,
+                e => Error::DbOperationFailed
+            })
     }
 
     /// Put a key/value pair.
@@ -289,10 +344,23 @@ impl Database {
     ///
     /// # Thread Safety
     /// Requires a write transaction. Only one write transaction can be active at a time.
-    pub fn put(&self, txn: &Transaction, key: &[u8], data: &[u8], flags: u32) -> Result<()> {
+    pub fn put(&self, txn: &Transaction, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
+        self.validate_write_transaction(txn)?;
+        self.validate_key_size(txn, key)?;
+        self.validate_flags(flags)?;
+
         let key_val = Value::new(key);
         let data_val = Value::new(data);
-        txn.put_value(self.dbi, &key_val, &data_val, flags)
+        
+        txn.put_value(self.dbi, &key_val, &data_val, flags.bits())
+            .map_err(|e| match e {
+                Error::MapFull => Error::DirtyPagesExceeded,
+                Error::TxnFull => Error::TxnDirtyLimit,
+                Error::KeyExist if flags.contains(WriteFlags::NOOVERWRITE) => Error::KeyExist,
+                Error::BadTxn => Error::InvalidTxnState,
+                Error::BadValSize => Error::BadValSize,
+                e => Error::DbOperationFailed
+            })
     }
 
     /// Delete a key/value pair.
@@ -312,9 +380,24 @@ impl Database {
     /// # Thread Safety
     /// Requires a write transaction. Only one write transaction can be active at a time.
     pub fn del(&self, txn: &Transaction, key: &[u8], data: Option<&[u8]>) -> Result<()> {
+        self.validate_write_transaction(txn)?;
+        self.validate_key_size(txn, key)?;
+
+        if data.is_some() && !self.flags.contains(DbFlags::DUPSORT) {
+            return Err(Error::Incompatible);
+        }
+
         let key_val = Value::new(key);
         let data_val = data.map(Value::new);
+        
         txn.del_value(self.dbi, &key_val, data_val.as_ref())
+            .map_err(|e| match e {
+                Error::NotFound => Error::NotFound,
+                Error::BadValSize => Error::BadValSize,
+                Error::BadTxn => Error::InvalidTxnState,
+                Error::TxnFull => Error::TxnDirtyLimit,
+                e => Error::DbOperationFailed
+            })
     }
 
     /// Create a cursor for this database.
@@ -330,6 +413,14 @@ impl Database {
     /// Cursors inherit the thread safety properties of their parent transaction.
     /// Multiple cursors can be created from the same transaction.
     pub fn cursor(&self) -> Result<Cursor> {
+        self.validate_db_state()?;
+        
+        if !self.txn.as_ref().is_valid() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        self.validate_cursor_state(self.txn.as_ref())?;
+
         Ok(Cursor {
             txn: self.txn,
             dbi: self.dbi,
@@ -356,7 +447,17 @@ impl Database {
     /// the database contains data may lead to undefined behavior.
     pub fn set_compare<F>(&self, cmp: F) -> Result<()>
     where F: Fn(&[u8], &[u8]) -> Ordering + 'static {
-        self.info.borrow_mut().cmp = Some(Box::new(cmp));
+        if self.dbi == 0 {
+            return Err(Error::BadDbi);
+        }
+
+        if !self.txn.as_ref().is_valid() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        self.info.try_borrow_mut()
+            .map_err(|_| Error::ResourceCleanupFailed)?
+            .cmp = Some(Box::new(cmp));
         Ok(())
     }
 
@@ -375,23 +476,138 @@ impl Database {
     /// the database contains data may lead to undefined behavior.
     pub fn set_dupsort<F>(&self, cmp: F) -> Result<()>
     where F: Fn(&[u8], &[u8]) -> Ordering + 'static {
-        self.info.borrow_mut().dupsort = Some(Box::new(cmp));
+        if !self.flags.contains(DbFlags::DUPSORT) {
+            return Err(Error::Incompatible);
+        }
+        if self.dbi == 0 {
+            return Err(Error::BadDbi);
+        }
+
+        if !self.txn.as_ref().is_valid() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        self.info.try_borrow_mut()
+            .map_err(|_| Error::ResourceCleanupFailed)?
+            .dupsort = Some(Box::new(cmp));
+        Ok(())
+    }
+
+    // Add internal helper method for validation checks
+    fn validate_transaction(&self, txn: &Transaction) -> Result<()> {
+        if self.dbi == 0 {
+            return Err(Error::BadDbi);
+        }
+
+        if !txn.is_valid() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        if !self.txn.as_ref().is_same_env(txn) {
+            return Err(Error::Incompatible);
+        }
+
+        Ok(())
+    }
+
+    // Add helper for write transaction validation
+    fn validate_write_transaction(&self, txn: &Transaction) -> Result<()> {
+        self.validate_transaction(txn)?;
+
+        if txn.is_readonly() {
+            return Err(Error::TxnReadOnlyOp);
+        }
+
+        Ok(())
+    }
+
+    // Add helper for key/data validation
+    fn validate_key_size(&self, txn: &Transaction, key: &[u8]) -> Result<()> {
+        let max_size = txn.max_key_size();
+        if key.len() > max_size {
+            return Err(Error::BadValSize);
+        }
+        Ok(())
+    }
+
+    // Add validation for database state
+    fn validate_db_state(&self) -> Result<()> {
+        if self.dbi == 0 {
+            return Err(Error::BadDbi);
+        }
+
+        if self.txn.is_null() {
+            return Err(Error::InvalidTxnState);
+        }
+
+        if let Err(_) = self.info.try_borrow() {
+            return Err(Error::ResourceCleanupFailed);
+        }
+        if let Err(_) = self.stats.try_borrow() {
+            return Err(Error::ResourceCleanupFailed);
+        }
+
+        Ok(())
+    }
+
+    // Add validation for database flags
+    fn validate_flags(&self, flags: WriteFlags) -> Result<()> {
+        if flags.contains(WriteFlags::NODUPDATA) && !self.flags.contains(DbFlags::DUPSORT) {
+            return Err(Error::Incompatible);
+        }
+        if flags.contains(WriteFlags::APPENDDUP) && !self.flags.contains(DbFlags::DUPSORT) {
+            return Err(Error::Incompatible);
+        }
+        if flags.contains(WriteFlags::MULTIPLE) && flags.contains(WriteFlags::APPEND) {
+            return Err(Error::Incompatible);
+        }
+        Ok(())
+    }
+
+    fn validate_cursor_state(&self, txn: &Transaction) -> Result<()> {
+        let cursor_count = txn.cursor_count();
+        let max_cursors = txn.max_cursors();
+        
+        if cursor_count >= max_cursors {
+            return Err(Error::CursorFull);
+        }
+
+        if txn.has_active_cursors(self.dbi) && txn.is_finished() {
+            return Err(Error::InvalidStateTransition);
+        }
+
         Ok(())
     }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
-        // Reset all database fields
-        let _ = self.close();
-        // Clear transaction reference safely
+        if let Err(e) = self.close() {
+            match e {
+                Error::BadDbi => (), // Already closed
+                Error::InvalidTxnState | Error::ResourceCleanupFailed => self.cleanup_resources(),
+                _ => self.cleanup_resources(),
+            }
+        }
         self.txn = NonNull::dangling();
-        // Clear any custom comparison functions
+    }
+}
+
+impl Database {
+    // Add helper method for cleanup during drop
+    fn cleanup_resources(&mut self) {
         if let Ok(mut info) = self.info.try_borrow_mut() {
             info.cmp = None;
             info.dupsort = None;
             info.rel = None;
             info.relctx = None;
         }
+        
+        if let Ok(mut stats) = self.stats.try_borrow_mut() {
+            *stats = DbStats::default();
+        }
+
+        self.dbi = 0;
+        self.flags = DbFlags::empty();
     }
 }

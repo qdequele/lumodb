@@ -6,8 +6,7 @@ mod env;
 mod error;
 mod midl;
 mod transaction;
-mod types;
 mod value;
 
 
-// Check Database -> Transaction -> Environment
+// Check Cursor -> Database -> Transaction -> Environment

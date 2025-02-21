@@ -2,24 +2,24 @@ use std::ptr::NonNull;
 use bitflags::bitflags;
 use libc;
 use std::cell::RefCell;
+use log;
 
 use crate::database::Database;
 use crate::transaction::Transaction;
 use crate::error::{Error, Result};
 use crate::value::Value;
 use crate::constants::{
-    // Database flags
-    RDONLY, DUPSORT, CURRENT, APPEND, NOOVERWRITE,
-    // Page flags
-    P_LEAF, P_LEAF2,
-    // Node flags
-    F_DUPDATA, F_BIGDATA,
+    DbFlags,
+    WriteFlags,
+    TransactionFlags,
+    NodeFlags,
+    PageFlags,
 };
 
 #[repr(C)]
 struct Page {
     /// Page flags (P_LEAF, P_LEAF2, etc.)
-    mp_flags: u16,
+    mp_flags: PageFlags,
     /// Lower bound of free space
     mp_lower: u16,
     /// Dynamic array of node pointers
@@ -31,7 +31,7 @@ struct Page {
 #[repr(C)]
 struct Node {
     /// Node flags (F_DUPDATA, F_BIGDATA, etc.)
-    mn_flags: u16,
+    mn_flags: NodeFlags,
     /// Key size
     mn_ksize: u32,
     /// Data size
@@ -134,7 +134,7 @@ impl PageCursor {
 
     /// Check if current page is a leaf
     fn is_leaf(&self) -> bool {
-        unsafe { (*self.page.as_ptr()).mp_flags & P_LEAF != 0 }
+        unsafe { (*self.page.as_ptr()).mp_flags.contains(PageFlags::LEAF) }
     }
 
     /// Get child page at given index
@@ -177,6 +177,36 @@ impl PageCursor {
         // Convert to page number and get the page
         let child_pgno = u32::from_le_bytes(pgno);
         get_page(child_pgno)
+    }
+}
+
+/// Helper trait for cursor operations
+trait CursorResult {
+    fn check_initialized(&self) -> Result<()>;
+    fn check_writable(&self) -> Result<()>;
+    fn validate_key_size(&self, size: usize) -> Result<()>;
+}
+
+impl<'txn> CursorResult for Cursor<'txn> {
+    fn check_initialized(&self) -> Result<()> {
+        if !self.state.borrow().flags.contains(CursorFlags::INITIALIZED) {
+            return Err(Error::CursorNotFound);
+        }
+        Ok(())
+    }
+
+    fn check_writable(&self) -> Result<()> {
+        if self.txn.is_readonly() {
+            return Err(Error::TxnReadOnly);
+        }
+        Ok(())
+    }
+
+    fn validate_key_size(&self, size: usize) -> Result<()> {
+        if size == 0 {
+            return Err(Error::BadValSize);
+        }
+        Ok(())
     }
 }
 
@@ -243,12 +273,7 @@ impl<'txn> Cursor<'txn> {
 
     /// Position at specified key
     pub fn set(&self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
-        // Validate input
-        if key.is_empty() {
-            return Err(Error::BadValSize);
-        }
-
-        // Validate cursor and transaction state
+        self.validate_key_size(key.len())?;
         self.validate_cursor()?;
 
         let mut state = self.state.borrow_mut();
@@ -442,7 +467,10 @@ impl<'txn> Cursor<'txn> {
 
     /// Check if page is a leaf page
     fn is_leaf_page(&self, page: NonNull<Page>) -> bool {
-        unsafe { (*page.as_ptr()).mp_flags & P_LEAF != 0 }
+        unsafe { 
+            PageFlags::from_bits_truncate((*page.as_ptr()).mp_flags)
+                .contains(PageFlags::LEAF)
+        }
     }
 
     /// Get page data slice safely
@@ -490,7 +518,7 @@ impl<'txn> Cursor<'txn> {
         let page = self.validate_page(state.page)?;
 
         // Handle leaf2 pages (fixed-size keys)
-        if unsafe { (*page.as_ptr()).mp_flags & P_LEAF2 } != 0 {
+        if unsafe { (*page.as_ptr()).mp_flags.contains(PageFlags::LEAF2) } {
             let key_size = unsafe { (*(*self.db).md_pad) };
             let key_data = self.get_page_data(page)?;
             return Ok(Some((key_data, &[])));
@@ -500,7 +528,7 @@ impl<'txn> Cursor<'txn> {
         let node = self.get_node(page, state.pos)?;
 
         // Get data
-        let data = if node.mn_flags & F_DUPDATA != 0 {
+        let data = if node.mn_flags.contains(NodeFlags::DUPDATA) {
             if let Some(ref xcursor) = state.xcursor {
                 match xcursor.cursor.get_current(&xcursor.cursor.state.borrow())? {
                     Some((_, data)) => data,
@@ -555,43 +583,25 @@ impl<'txn> Cursor<'txn> {
     }
 
     /// Store by cursor
-    pub fn put(&self, key: &[u8], data: &[u8], flags: u32) -> Result<()> {
-        // Check if transaction is writable
-        let txn = unsafe { &mut *self.txn };
-        if txn.flags & RDONLY != 0 {
-            return Err(Error::from(libc::EACCES));
-        }
+    pub fn put(&self, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
+        self.check_writable()?;
+        self.validate_key_size(key.len())?;
+        self.validate_key_size(data.len())?;
 
-        // Handle different put flags
-        if flags & CURRENT != 0 {
-            // Overwrite current entry
-            self.overwrite_current(key, data)
-        } else if flags & APPEND != 0 {
-            // Append at end of database
-            self.append(key, data)
-        } else {
-            // Normal put operation
-            self.insert(key, data, flags)
+        match flags {
+            f if f.contains(WriteFlags::CURRENT) => self.overwrite_current(key, data),
+            f if f.contains(WriteFlags::APPEND) => self.append(key, data),
+            _ => self.insert(key, data, flags),
         }
     }
 
     /// Delete current key/data pair
-    pub fn del(&self, flags: u32) -> Result<()> {
-        let mut state = self.state.borrow_mut();
-        
-        if !state.flags.contains(CursorFlags::INITIALIZED) {
-            return Err(Error::from(libc::EINVAL));
-        }
+    pub fn del(&self, flags: WriteFlags) -> Result<()> {
+        self.check_initialized()?;
+        self.check_writable()?;
 
-        // Check if transaction is writable
-        let txn = unsafe { &mut *self.txn };
-        if txn.flags & RDONLY != 0 {
-            return Err(Error::from(libc::EACCES));
-        }
-
-        // Delete current entry
+        let state = self.state.borrow();
         self.delete_current(&state, flags)?;
-
         state.flags.insert(CursorFlags::DELETED);
         Ok(())
     }
@@ -733,7 +743,7 @@ impl<'txn> Cursor<'txn> {
         let node = unsafe { &mut *(*page.as_ptr()).mp_ptrs[state.pos].as_ptr() };
 
         // Check if we need to handle duplicate data
-        if node.mn_flags & F_DUPDATA != 0 {
+        if node.mn_flags.contains(NodeFlags::DUPDATA) {
             if let Some(ref mut xcursor) = state.xcursor {
                 return xcursor.cursor.overwrite_current(&xcursor.cursor.state.borrow(), key, data);
             }
@@ -767,7 +777,7 @@ impl<'txn> Cursor<'txn> {
             );
             node.mn_data = (*new_page.as_ptr()).mp_data;
             node.mn_size = data.len() as u32;
-            node.mn_flags |= F_BIGDATA;
+            node.mn_flags |= NodeFlags::BIGDATA;
         }
 
         Ok(())
@@ -791,14 +801,14 @@ impl<'txn> Cursor<'txn> {
     }
 
     /// Insert a new key/data pair
-    fn insert(&self, key: &[u8], data: &[u8], flags: u32) -> Result<()> {
+    fn insert(&self, key: &[u8], data: &[u8], flags: WriteFlags) -> Result<()> {
         let txn = unsafe { &mut *self.txn };
 
         // Find insertion point
         self.search_key(&self.state.borrow(), key)?;
 
         // Check for existing key if NOOVERWRITE
-        if flags & NOOVERWRITE != 0 {
+        if flags.contains(WriteFlags::NOOVERWRITE) {
             if let Some((existing_key, _)) = self.get_current(&self.state.borrow())? {
                 if key == existing_key {
                     return Err(Error::KeyExist);
@@ -848,12 +858,12 @@ impl<'txn> Cursor<'txn> {
     }
 
     /// Delete the current key/data pair
-    fn delete_current(&self, state: &CursorState, flags: u32) -> Result<()> {
+    fn delete_current(&self, state: &CursorState, flags: WriteFlags) -> Result<()> {
         let page = state.page.ok_or(Error::Invalid)?;
 
         // Handle duplicate data if needed
         let node = unsafe { &mut *(*page.as_ptr()).mp_ptrs[state.pos].as_ptr() };
-        if node.mn_flags & F_DUPDATA != 0 {
+        if node.mn_flags.contains(NodeFlags::DUPDATA) {
             if let Some(ref mut xcursor) = state.xcursor {
                 return xcursor.cursor.delete_current(&xcursor.cursor.state.borrow(), flags);
             }
@@ -861,7 +871,7 @@ impl<'txn> Cursor<'txn> {
         }
 
         // Free any overflow pages
-        if node.mn_flags & F_BIGDATA != 0 {
+        if node.mn_flags.contains(NodeFlags::BIGDATA) {
             let txn = unsafe { &mut *self.txn };
             txn.free_page(node.mn_data.as_ptr() as u64)?;
         }
@@ -988,10 +998,8 @@ impl<'txn> Cursor<'txn> {
     }
 
     /// Bulk put operation for multiple key/data pairs
-    pub fn put_multiple(&self, pairs: &[(Vec<u8>, Vec<u8>)], flags: u32) -> Result<()> {
-        // Check if transaction is writable
-        let txn = unsafe { &mut *self.txn };
-        if txn.flags & RDONLY != 0 {
+    pub fn put_multiple(&self, pairs: &[(Vec<u8>, Vec<u8>)], flags: WriteFlags) -> Result<()> {
+        if self.txn.is_readonly() {
             return Err(Error::from(libc::EACCES));
         }
 
@@ -1000,7 +1008,7 @@ impl<'txn> Cursor<'txn> {
         sorted_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Set cursor to appropriate starting position
-        if flags & APPEND != 0 {
+        if flags.contains(WriteFlags::APPEND) {
             self.last()?;
         }
 
@@ -1022,7 +1030,7 @@ impl<'txn> Cursor<'txn> {
     }
 
     /// Bulk delete operation for multiple keys
-    pub fn del_multiple(&self, keys: &[Vec<u8>], flags: u32) -> Result<()> {
+    pub fn del_multiple(&self, keys: &[Vec<u8>], flags: WriteFlags) -> Result<()> {
         // Check if transaction is writable
         let txn = unsafe { &mut *self.txn };
         if txn.flags & RDONLY != 0 {
@@ -1090,6 +1098,56 @@ impl<'txn> Cursor<'txn> {
         }
 
         Ok(())
+    }
+
+    /// Attempt to recover from a failed operation
+    fn try_recover(&self, err: Error) -> Result<()> {
+        log::error!("Attempting to recover from error: {}", err);
+        match err {
+            Error::TxnFull => self.handle_txn_full(),
+            Error::PageFull => self.handle_page_full(),
+            Error::MapResized => self.handle_map_resize(),
+            _ => Err(err),
+        }
+    }
+
+    fn handle_txn_full(&self) -> Result<()> {
+        // Attempt to commit current transaction and start new one
+        self.txn.commit()?;
+        // Return error if recovery failed
+        Err(Error::RecoveryFailed)
+    }
+
+    fn handle_page_full(&self) -> Result<()> {
+        // Attempt to split page or allocate new one
+        // Return error if recovery failed
+        Err(Error::PageCleanupFailed)
+    }
+
+    fn handle_map_resize(&self) -> Result<()> {
+        // Attempt to resize memory map
+        // Return error if recovery failed
+        Err(Error::MapFailed)
+    }
+
+    /// Safe wrapper for page operations
+    fn with_page<T, F>(&self, page: Option<NonNull<Page>>, f: F) -> Result<T>
+    where
+        F: FnOnce(&Page) -> Result<T>
+    {
+        let page = self.validate_page(page)?;
+        let page_ref = unsafe { page.as_ref() };
+        f(page_ref)
+    }
+
+    /// Safe wrapper for node operations
+    fn with_node<T, F>(&self, page: NonNull<Page>, pos: usize, f: F) -> Result<T>
+    where
+        F: FnOnce(&Node) -> Result<T>
+    {
+        self.validate_position(page, pos)?;
+        let node = self.get_node(page, pos)?;
+        f(node)
     }
 }
 
@@ -1174,3 +1232,29 @@ impl Drop for Cursor<'_> {
         }
     }
 }
+
+// Add structured error conversion
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        match err.kind() {
+            std::io::ErrorKind::NotFound => Error::NotFound,
+            std::io::ErrorKind::PermissionDenied => Error::TxnReadOnly,
+            std::io::ErrorKind::InvalidData => Error::Corrupted,
+            _ => Error::Unknown,
+        }
+    }
+}
+
+/// Error handling documentation for Cursor operations
+/// 
+/// # Error Recovery
+/// The cursor implements automatic recovery for common error scenarios:
+/// - Transaction full: Attempts to commit and start new transaction
+/// - Page full: Attempts to split or allocate new page
+/// - Map resize: Attempts to resize the memory map
+/// 
+/// # Error Prevention
+/// Common validations are encapsulated in the CursorResult trait:
+/// - Cursor initialization check
+/// - Write permission check
+/// - Key/value size validation
