@@ -7,37 +7,39 @@ use crate::database::Database;
 use crate::transaction::Transaction;
 use crate::error::{Error, Result};
 use crate::value::Value;
-
-// Constants from LMDB
-const RDONLY: u32 = 0x20000;
-const DUPSORT: u32 = 0x04;
-const CURRENT: u32 = 0x04;
-const APPEND: u32 = 0x20;
-const NOOVERWRITE: u32 = 0x10;
-
-// Page flags
-const P_LEAF: u16 = 0x01;
-const P_LEAF2: u16 = 0x02;
-
-// Node flags
-const F_DUPDATA: u16 = 0x01;
-const F_BIGDATA: u16 = 0x02;
+use crate::constants::{
+    // Database flags
+    RDONLY, DUPSORT, CURRENT, APPEND, NOOVERWRITE,
+    // Page flags
+    P_LEAF, P_LEAF2,
+    // Node flags
+    F_DUPDATA, F_BIGDATA,
+};
 
 #[repr(C)]
 struct Page {
+    /// Page flags (P_LEAF, P_LEAF2, etc.)
     mp_flags: u16,
+    /// Lower bound of free space
     mp_lower: u16,
+    /// Dynamic array of node pointers
     mp_ptrs: [NonNull<Node>; 0],
+    /// Dynamic array of page data
     mp_data: [u8; 0],
 }
 
 #[repr(C)]
 struct Node {
+    /// Node flags (F_DUPDATA, F_BIGDATA, etc.)
     mn_flags: u16,
+    /// Key size
     mn_ksize: u32,
+    /// Data size
     mn_size: u32,
+    /// Dynamic array for key data
     mn_key: [u8; 0],
-    mn_data: [u8; 0],
+    /// Dynamic array for node data
+    mn_data: [u8; 0], 
 }
 
 // Remove external C functions and just keep the operation constants 

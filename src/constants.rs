@@ -5,6 +5,8 @@ pub const MDB_VERSION: u32 = 1;
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 9;
 pub const VERSION_PATCH: u32 = 70;
+/// Core database identifiers reserved by LMDB
+pub const CORE_DBS: u32 = 2;
 
 // Environment flags
 pub const FIXEDMAP: u32 = 0x01;
