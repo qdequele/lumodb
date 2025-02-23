@@ -1,6 +1,5 @@
 use std::ptr;
 use std::alloc::{self, Layout};
-use std::cmp::Ordering;
 
 bitflags::bitflags! {
     /// Flags for IDL operations

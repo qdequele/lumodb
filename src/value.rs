@@ -2,30 +2,50 @@
 // - Debug trait (automatically in scope from prelude)
 // - Basic slice operations (automatically in scope from prelude)
 
-/// Safe wrapper for MDB_val
-#[derive(Debug)]
+use std::borrow::Cow;
+
+/// A value that can be stored in the database
+#[derive(Debug, Clone)]
 pub struct Value<'a> {
-    size: usize,
-    data: &'a [u8],
+    /// The raw bytes of the value
+    data: Cow<'a, [u8]>,
 }
 
 impl<'a> Value<'a> {
+    /// Create a new value from a byte slice
     pub fn new(data: &'a [u8]) -> Self {
-        Value {
-            size: data.len(),
-            data,
+        Self {
+            data: Cow::Borrowed(data),
         }
     }
 
+    /// Create a new owned value
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        Self {
+            data: Cow::Owned(data),
+        }
+    }
+
+    /// Get the raw bytes of the value
     pub fn as_bytes(&self) -> &[u8] {
-        self.data
+        &self.data
     }
+}
 
-    pub fn len(&self) -> usize {
-        self.size
+impl<'a> AsRef<[u8]> for Value<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.size == 0
+impl<'a> From<&'a [u8]> for Value<'a> {
+    fn from(data: &'a [u8]) -> Self {
+        Self::new(data)
+    }
+}
+
+impl<'a> From<Vec<u8>> for Value<'a> {
+    fn from(data: Vec<u8>) -> Self {
+        Self::from_vec(data)
     }
 }
